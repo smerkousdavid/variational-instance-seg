@@ -1,25 +1,30 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from abc import ABCMeta, abstractmethod
+from abc import ABCMeta
 from typing import Dict, List, Tuple, Union
 
-from torch import Tensor
+import cv2
+import numpy as np
 import torch
+import torch.nn as nn
+from torch import Tensor
+from torchvision.transforms import transforms
 
 from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig
+from ..layers import DetrTransformerEncoder, SinePositionalEncoding
+# from ..utils import (filter_scores_and_topk, select_single_mlvl,
+#                      unpack_gt_instances)
 from .base import BaseDetector
-from ..layers import (DetrTransformerDecoder, DetrTransformerEncoder,
-                      SinePositionalEncoding)
-from ..utils import (filter_scores_and_topk, select_single_mlvl,
-                     unpack_gt_instances)
+
+cur_img = 0
 
 
 @MODELS.register_module()
 class DVIS(BaseDetector, metaclass=ABCMeta):
     r"""Base class for @TODO add desc
-    
-    
+
+
     Args:
         backbone (:obj:`ConfigDict` or dict): Config of the backbone.
         neck (:obj:`ConfigDict` or dict, optional): Config of the neck.
@@ -52,6 +57,7 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
                  encoder: OptConfigType = None,
                  decoder: OptConfigType = None,
                  bbox_head: OptConfigType = None,
+                 dvis_head: OptConfigType = None,
                  positional_encoding: OptConfigType = None,
                  num_queries: int = 100,
                  train_cfg: OptConfigType = None,
@@ -75,21 +81,21 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
         if neck is not None:
             self.neck = MODELS.build(neck)
         self.bbox_head = MODELS.build(bbox_head)
+        self.dvis_head = MODELS.build(dvis_head)
         self._init_layers()
 
     # @abstractmethod
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""
-        self.positional_encoding = SinePositionalEncoding(**self.positional_encoding)
+        self.positional_encoding = SinePositionalEncoding(
+            **self.positional_encoding)
         self.encoder = DetrTransformerEncoder(**self.encoder)
         self.embed_dims = self.encoder.embed_dims
-        
+
         num_feats = self.positional_encoding.num_feats
         assert num_feats * 2 == self.embed_dims, \
             'embed_dims should be exactly 2 times of num_feats. ' \
             f'Found {self.embed_dims} and {num_feats}.'
-
-
 
     def pre_transformer(
             self,
@@ -144,9 +150,10 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
             # NOTE following the official DETR repo, non-zero values represent
             # ignored positions, while zero values mean valid positions.
 
-            masks = F.interpolate(
-                masks.unsqueeze(1),
-                size=feat.shape[-2:]).to(torch.bool).squeeze(1)
+            raise NotImplementedError('fix F not found')
+            # masks = F.interpolate(
+            #     masks.unsqueeze(1),
+            #     size=feat.shape[-2:]).to(torch.bool).squeeze(1)
             # [batch_size, embed_dim, h, w]
             pos_embed = self.positional_encoding(masks)
 
@@ -163,7 +170,6 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
             feat=feat, feat_mask=masks, feat_pos=pos_embed)
         decoder_inputs_dict = dict(memory_mask=masks, memory_pos=pos_embed)
         return encoder_inputs_dict, decoder_inputs_dict
-
 
     def forward_encoder(self, feat: Tensor, feat_mask: Tensor,
                         feat_pos: Tensor) -> Dict:
@@ -206,35 +212,110 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
         Returns:
             dict: A dictionary of loss components
         """
-        # img_feats = self.extract_feat(batch_inputs)
-        # head_inputs_dict = self.forward_embedding(img_feats, batch_data_samples)
-        
-        # encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(head_inputs_dict['feat'], batch_data_samples)
-        # encoder_outputs_dict = self.forward_encoder(**encoder_inputs_dict)
-        
-        batch_gt_instances, batch_gt_instances_ignore, batch_img_metas = unpack_gt_instances(batch_data_samples)
-        
-        # losses = self.bbox_head.loss(
-        #     **head_inputs_dict, batch_data_samples=batch_data_samples)
+        global cur_img
 
-        # extract features
-        # feat, mag = head_inputs_dict['feat'], head_inputs_dict['mag']
-        
-        # flatten feats / mag
-        
-        
-        # binary loss to suppress magnitude of all features of background
-        # while moving all foreground above some margin
-        binary_margin = 0.5
-        
-        
-        
-        val = torch.tensor(0.0, device='cuda', requires_grad=True)
-        losses = {
-            'loss_all': val.sum()
-        }
+        img_feats = self.extract_feat(batch_inputs)
+        # head_inputs_dict = self.forward_embedding
+        # (img_feats, batch_data_samples)
 
-        return  losses
+        losses, mask_f, norms, sal = self.dvis_head.loss(
+            img_feats, batch_data_samples)
+
+        # visualize results
+        invTrans = transforms.Compose([
+            transforms.Normalize(
+                mean=[0., 0., 0.], std=[1 / 58.395, 1 / 57.12, 1 / 57.375]),
+            transforms.Normalize(
+                mean=[-123.675, -116.28, -103.53], std=[1., 1., 1.]),
+        ])
+        input_img = batch_inputs[0].detach().clone()
+        input_img = invTrans(input_img).detach().permute(
+            1, 2, 0).cpu().numpy()[:, :, :]
+
+        forg = torch.sigmoid(sal[0])
+
+        # forg_ind = (forg > 0.5).nonzero()
+
+        # # create blank
+        # inst = torch.zeros_like(forg)
+
+        # create random projection to 3d
+        norms = torch.where(
+            forg > 0.5,
+            norms[0],
+            torch.ones_like(norms[0]) *
+            10000  # some high number bring vector close to 0
+        )
+
+        with torch.no_grad():
+            # random projection
+            for i in range(10):
+                weight = torch.empty((3, mask_f.shape[1], 1, 1),
+                                     device=norms.device,
+                                     dtype=torch.float)
+                nn.init.uniform_(weight)
+                weight = weight / torch.linalg.norm(
+                    weight, ord=2, dim=1, keepdim=True)
+                projected = nn.functional.conv2d(mask_f[0], weight)
+
+                # scale between 0-255
+                projected = projected + projected.min()
+                projected = (projected / projected.max()) * 255.0
+
+                # continue if not white
+                if torch.sum(projected.mean(0) > 200).item() < (
+                        0.5 * (projected.shape[1] * projected.shape[2])):
+                    break
+
+            projected1 = projected
+            for i in range(10):
+                weight = torch.empty((3, mask_f.shape[1], 1, 1),
+                                     device=norms.device,
+                                     dtype=torch.float)
+                nn.init.uniform_(weight)
+                weight = weight / torch.linalg.norm(
+                    weight, ord=2, dim=1, keepdim=True)
+
+                projected = nn.functional.conv2d(mask_f[0], weight)
+
+                # scale between 0-255
+                projected = projected + projected.min()
+                projected = (projected / projected.max()) * 255.0
+
+                # continue if not white
+                if torch.sum(projected.mean(0) > 200).item() < (
+                        0.5 * (projected.shape[1] * projected.shape[2])):
+                    break
+
+            # saliency
+            sal = torch.clamp(forg * 255.0, 0,
+                              255).to(torch.uint8).detach().clone().permute(
+                                  1, 2, 0).cpu().numpy()[:, :, 0]
+            sal = cv2.resize(sal, (input_img.shape[1], input_img.shape[0]))
+            sal = cv2.cvtColor(sal, cv2.COLOR_GRAY2RGB)
+
+            # rgb projection
+            proj1 = torch.clamp(projected1, 0,
+                                255).to(torch.uint8).detach().clone().permute(
+                                    1, 2, 0).cpu().numpy()[:, :, :]
+            proj1 = cv2.resize(proj1, (input_img.shape[1], input_img.shape[0]))
+
+            proj = torch.clamp(projected, 0,
+                               255).to(torch.uint8).detach().clone().permute(
+                                   1, 2, 0).cpu().numpy()[:, :, :]
+            proj = cv2.resize(proj, (input_img.shape[1], input_img.shape[0]))
+
+            # horz stack
+            input_img = np.hstack((input_img, sal, proj1, proj))
+            cv2.imwrite(f'test_{cur_img}.png', input_img)
+            cur_img += 1
+            cur_img = cur_img % 100
+        # val = torch.tensor(0.0, device='cuda', requires_grad=True)
+        # losses = {
+        #     'loss_all': val.sum()
+        # }
+
+        return losses
 
     def predict(self,
                 batch_inputs: Tensor,
@@ -263,10 +344,11 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
             - bboxes (Tensor): Has a shape (num_instances, 4),
               the last dimension 4 arrange as (x1, y1, x2, y2).
         """
-        raise NotImplementedError('not yet')
+        return []
+        # raise NotImplementedError('not yet')
         img_feats = self.extract_feat(batch_inputs)
         head_inputs_dict = self.forward_embedding(img_feats,
-                                                    batch_data_samples)
+                                                  batch_data_samples)
         results_list = self.bbox_head.predict(
             **head_inputs_dict,
             rescale=rescale,
@@ -292,25 +374,23 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
         Returns:
             tuple[Tensor]: A tuple of features from ``bbox_head`` forward.
         """
-        raise NotImplementedError('not yet')
+        return []
+        # raise NotImplementedError('not yet')
         img_feats = self.extract_feat(batch_inputs)
         head_inputs_dict = self.forward_embedding(img_feats,
-                                                    batch_data_samples)
+                                                  batch_data_samples)
         results = self.bbox_head.forward(**head_inputs_dict)
         return results
-    
+
     def forward_embedding(self,
-                            img_feats: Tuple[Tensor],
-                            batch_data_samples: OptSampleList = None) -> Dict:
+                          img_feats: Tuple[Tensor],
+                          batch_data_samples: OptSampleList = None) -> Dict:
         feat = img_feats[-1]  # NOTE img_feats contains only one feature.
         mag = torch.linalg.vector_norm(feat, ord=2, dim=1, keepdim=True)
-        
+
         # print(feat.shape, mag.shape)
-        
-        head_inputs_dict = {
-            'feat': feat,
-            'mag': mag 
-        }
+
+        head_inputs_dict = {'feat': feat, 'mag': mag}
 
         return head_inputs_dict
 

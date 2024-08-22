@@ -14,6 +14,7 @@ model = dict(
         type='CSPNeXt',
         arch='P5',
         expand_ratio=0.5,
+        out_indices=(1, 2, 3, 4),
         deepen_factor=1,
         widen_factor=1,
         channel_attention=True,
@@ -42,13 +43,40 @@ model = dict(
     #     expand_ratio=0.5,
     #     norm_cfg=dict(type='SyncBN'),
     #     act_cfg=dict(type='SiLU', inplace=True)),
-    neck=dict(
-        type='TFPN',
-        in_channels=[256, 512, 1024],
-        out_channels=64,
-        start_level=1,
-        add_extra_convs='on_output',
-        act_cfg=dict(type='SiLU', inplace=True)
+    # neck=dict(
+    #     type='TFPN',
+    #     in_channels=[256, 512, 1024],
+    #     out_channels=64,
+    #     start_level=1,
+    #     add_extra_convs='on_output',
+    #     act_cfg=dict(type='SiLU', inplace=True)
+    # ),
+    neck=None,
+    dvis_head=dict(
+        type='DVISHead',
+        num_classes=80,
+        in_channels=[64, 128, 256, 512],  # [128, 256, 512, 1024],
+        feat_channels=256,
+        out_channels=16,
+        pixel_decoder=dict(
+            type='TransformerEncoderPixelDecoder',
+            norm_cfg=dict(type='GN', num_groups=32),
+            act_cfg=dict(type='ReLU'),
+            encoder=dict(  # DetrTransformerEncoder
+                num_layers=6,
+                layer_cfg=dict(  # DetrTransformerEncoderLayer
+                    self_attn_cfg=dict(  # MultiheadAttention
+                        embed_dims=256,
+                        num_heads=8,
+                        dropout=0.1,
+                        batch_first=True),
+                    ffn_cfg=dict(
+                        embed_dims=256,
+                        feedforward_channels=2048,
+                        num_fcs=2,
+                        ffn_drop=0.1,
+                        act_cfg=dict(type='ReLU', inplace=True)))),
+            positional_encoding=dict(num_feats=128, normalize=True)),
     ),
     bbox_head=dict(
         type='RTMDetSepBNHead',
@@ -87,7 +115,7 @@ model = dict(
 train_pipeline = [
     dict(type='LoadImageFromFile', backend_args={{_base_.backend_args}}),
     dict(type='LoadAnnotations', with_bbox=True),
-    dict(type='CachedMosaic', img_scale=(640, 640), pad_val=114.0),
+    # dict(type='CachedMosaic', img_scale=(640, 640), pad_val=114.0),
     dict(
         type='RandomResize',
         scale=(1280, 1280),
@@ -97,12 +125,12 @@ train_pipeline = [
     dict(type='YOLOXHSVRandomAug'),
     dict(type='RandomFlip', prob=0.5),
     dict(type='Pad', size=(640, 640), pad_val=dict(img=(114, 114, 114))),
-    dict(
-        type='CachedMixUp',
-        img_scale=(640, 640),
-        ratio_range=(1.0, 1.0),
-        max_cached_images=20,
-        pad_val=(114, 114, 114)),
+    # dict(
+    #     type='CachedMixUp',
+    #     img_scale=(640, 640),
+    #     ratio_range=(1.0, 1.0),
+    #     max_cached_images=20,
+    #     pad_val=(114, 114, 114)),
     dict(type='PackDetInputs')
 ]
 
@@ -144,8 +172,8 @@ test_dataloader = val_dataloader
 
 max_epochs = 300
 stage2_num_epochs = 20
-base_lr = 0.004
-interval = 10
+base_lr = 2.0e-5  # 0.004
+interval = 100000  # @TODO PUT BACK 10
 
 train_cfg = dict(
     max_epochs=max_epochs,
@@ -160,6 +188,8 @@ optim_wrapper = dict(
     _delete_=True,
     type='OptimWrapper',
     optimizer=dict(type='AdamW', lr=base_lr, weight_decay=0.05),
+    # gradient clipping
+    clip_grad=dict(max_norm=1.0, norm_type=2),
     paramwise_cfg=dict(
         norm_decay_mult=0, bias_decay_mult=0, bypass_duplicate=True))
 
@@ -167,7 +197,8 @@ optim_wrapper = dict(
 param_scheduler = [
     dict(
         type='LinearLR',
-        start_factor=1.0e-5,
+        # start_factor=1.0e-5,
+        start_factor=1.0e-6,
         by_epoch=False,
         begin=0,
         end=1000),

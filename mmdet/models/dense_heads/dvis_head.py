@@ -1,25 +1,65 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Dict, List, Tuple
+import copy
+# Copyright (c) OpenMMLab. All rights reserved.
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import Linear
+from mmcv.cnn import Conv2d, Linear
 from mmcv.cnn.bricks.transformer import FFN
-from mmengine.model import BaseModule
-from mmengine.structures import InstanceData
+from mmengine.model import BaseModule, caffe2_xavier_init
+from mmengine.structures import InstanceData, PixelData
 from torch import Tensor
 
 from mmdet.registry import MODELS, TASK_UTILS
 from mmdet.structures import SampleList
-from mmdet.structures.bbox import (bbox_cxcywh_to_xyxy, bbox_overlaps,
-                                   bbox_xyxy_to_cxcywh)
+from mmdet.structures.bbox import bbox_cxcywh_to_xyxy, bbox_xyxy_to_cxcywh
 from mmdet.utils import (ConfigType, InstanceList, OptInstanceList,
-                         OptMultiConfig, reduce_mean)
-from ..losses import QualityFocalLoss
+                         OptMultiConfig)
+# from ..losses import QualityFocalLoss
 from ..utils import multi_apply
 
 
+def preprocess_panoptic_gt(gt_labels: Tensor, gt_masks: Tensor,
+                           gt_semantic_seg: Tensor, num_things: int,
+                           num_stuff: int) -> Tuple[Tensor, Tensor]:
+    """Preprocess the ground truth for a image specifically for DVIS. @TODO
+    description.
+
+    Args:
+        gt_labels (Tensor): Ground truth labels of each bbox,
+            with shape (num_gts, ).
+        gt_masks (BitmapMasks): Ground truth masks of each instances
+            of a image, shape (num_gts, h, w).
+        gt_semantic_seg (Tensor | None): Ground truth of semantic
+            segmentation with the shape (1, h, w).
+            [0, num_thing_class - 1] means things,
+            [num_thing_class, num_class-1] means stuff,
+            255 means VOID. It's None when training instance segmentation.
+
+    Returns:
+        tuple[Tensor, Tensor]: a tuple containing the following targets.
+
+            - labels (Tensor): Ground truth class indices for a
+                image, with shape (n, ), n is the sum of number
+                of stuff type and number of instance in a image.
+            - masks (Tensor): Ground truth mask for a image, with
+                shape (n, h, w). Contains stuff and things when training
+                panoptic segmentation, and things only when training
+                instance segmentation.
+    """
+
+    things_masks: torch.Tensor = gt_masks.to_tensor(
+        dtype=torch.bool, device=gt_labels.device).long()
+
+    # create a thing index variant
+    # things_ind_mask = things_masks.argmax(dim=0, keepdim=True)
+    # print(gt_labels.shape, things_masks.shape, things_ind_mask.shape)
+
+    # see util/panoptic_gt_processing.py for original
+    return gt_labels, things_masks  # , things_ind_mask
 
 
 @MODELS.register_module()
@@ -55,6 +95,9 @@ class DVISHead(BaseModule):
     def __init__(
             self,
             num_classes: int,
+            in_channels: List[int],
+            feat_channels: int,
+            out_channels: int,
             embed_dims: int = 256,
             num_reg_fcs: int = 2,
             sync_cls_avg_factor: bool = False,
@@ -64,6 +107,11 @@ class DVISHead(BaseModule):
                 use_sigmoid=False,
                 loss_weight=1.0,
                 class_weight=1.0),
+            # num_transformer_feat_level: int = 3,
+            pixel_decoder: ConfigType = ...,
+            enforce_decoder_input_project: bool = False,
+            num_things_classes: int = 80,
+            num_stuff_classes: int = 53,
             loss_bbox: ConfigType = dict(type='L1Loss', loss_weight=5.0),
             loss_iou: ConfigType = dict(type='GIoULoss', loss_weight=2.0),
             train_cfg: ConfigType = dict(
@@ -79,6 +127,9 @@ class DVISHead(BaseModule):
         super().__init__(init_cfg=init_cfg)
         self.bg_cls_weight = 0
         self.sync_cls_avg_factor = sync_cls_avg_factor
+        self.num_things_classes = num_things_classes
+        self.num_stuff_classes = num_stuff_classes
+        self.num_classes = self.num_things_classes + self.num_stuff_classes
         class_weight = loss_cls.get('class_weight', None)
         if class_weight is not None and (self.__class__ is DVISHead):
             assert isinstance(class_weight, float), 'Expected ' \
@@ -114,12 +165,35 @@ class DVISHead(BaseModule):
         self.loss_bbox = MODELS.build(loss_bbox)
         self.loss_iou = MODELS.build(loss_iou)
 
+        # assert pixel_decoder.encoder.layer_cfg. \
+        #     self_attn_cfg.num_levels == num_transformer_feat_level
+        pixel_decoder_ = copy.deepcopy(pixel_decoder)
+        pixel_decoder_.update(
+            in_channels=in_channels,
+            feat_channels=feat_channels,
+            out_channels=out_channels)
+        self.pixel_decoder = MODELS.build(pixel_decoder_)
+
+        # if isinstance(self.pixel_decoder, PixelDecoder) and (
+        #         self.decoder_embed_dims != in_channels[-1]
+        #         or enforce_decoder_input_project):
+        #     self.decoder_input_proj = Conv2d(
+        #         in_channels[-1], self.decoder_embed_dims, kernel_size=1)
+        # else:
+        self.decoder_input_proj = nn.Identity()
+
         if self.loss_cls.use_sigmoid:
             self.cls_out_channels = num_classes
         else:
             self.cls_out_channels = num_classes + 1
 
         self._init_layers()
+
+    def init_weights(self) -> None:
+        if isinstance(self.decoder_input_proj, Conv2d):
+            caffe2_xavier_init(self.decoder_input_proj, bias=0)
+
+        self.pixel_decoder.init_weights()
 
     def _init_layers(self) -> None:
         """Initialize layers of the transformer head."""
@@ -139,8 +213,11 @@ class DVISHead(BaseModule):
         # in DAB-DETR (prelu in transformer and relu in reg_branch)
         self.fc_reg = Linear(self.embed_dims, 4)
 
-    def forward(self, hidden_states: Tensor) -> Tuple[Tensor]:
-        """"Forward function.
+    def forward(self, x: Tuple[Tensor],
+                batch_data_samples: SampleList) -> Tuple[Tensor]:
+        """"
+        @TODO FIX
+        Forward function.
 
         Args:
             hidden_states (Tensor): Features from transformer decoder. If
@@ -158,18 +235,86 @@ class DVISHead(BaseModule):
               head with normalized coordinate format (cx, cy, w, h), has shape
               (num_decoder_layers, bs, num_queries, 4).
         """
-        layers_cls_scores = self.fc_cls(hidden_states)
-        layers_bbox_preds = self.fc_reg(
-            self.activate(self.reg_ffn(hidden_states))).sigmoid()
-        return layers_cls_scores, layers_bbox_preds
 
-    def loss(self, hidden_states: Tensor,
-             batch_data_samples: SampleList) -> dict:
+        batch_img_metas = [
+            data_sample.metainfo for data_sample in batch_data_samples
+        ]
+        # batch_size = x[0].shape[0]
+        # input_img_h, input_img_w = batch_img_metas[0]['batch_input_shape']
+
+        # when backbone is swin, memory is output of last stage of swin.
+        # when backbone is r50, memory is output of tranformer encoder.
+        mask_features, _ = self.pixel_decoder(x, batch_img_metas)
+
+        # project to expected output chan dimension
+        # memory = self.decoder_input_proj(memory)
+
+        # layers_cls_scores = self.fc_cls(hidden_states)
+        # layers_bbox_preds = self.fc_reg(
+        #     self.activate(self.reg_ffn(hidden_states))).sigmoid()
+        # return layers_cls_scores, layers_bbox_preds
+
+        # handle saliency via feature norms
+        norms = torch.linalg.vector_norm(
+            mask_features, ord=2, dim=1, keepdim=True)
+        saliency = norms / mask_features.shape[1]
+
+        return mask_features, norms, saliency  # [], []
+
+    def preprocess_gt(
+            self, batch_gt_instances: InstanceList,
+            batch_gt_semantic_segs: List[Optional[PixelData]]) -> InstanceList:
+        """Preprocess the ground truth for all images.
+
+        Args:
+            batch_gt_instances (list[:obj:`InstanceData`]): Batch of
+                gt_instance. It usually includes ``labels``, each is
+                ground truth labels of each bbox, with shape (num_gts, )
+                and ``masks``, each is ground truth masks of each instances
+                of a image, shape (num_gts, h, w).
+            gt_semantic_seg (list[Optional[PixelData]]): Ground truth of
+                semantic segmentation, each with the shape (1, h, w).
+                [0, num_thing_class - 1] means things,
+                [num_thing_class, num_class-1] means stuff,
+                255 means VOID. It's None when training instance segmentation.
+
+        Returns:
+            list[obj:`InstanceData`]: each contains the following keys
+
+                - labels (Tensor): Ground truth class indices\
+                    for a image, with shape (n, ), n is the sum of\
+                    number of stuff type and number of instance in a image.
+                - masks (Tensor): Ground truth mask for a\
+                    image, with shape (n, h, w).
+        """
+        num_things_list = [self.num_things_classes] * len(batch_gt_instances)
+        num_stuff_list = [self.num_stuff_classes] * len(batch_gt_instances)
+        gt_labels_list = [
+            gt_instances['labels'] for gt_instances in batch_gt_instances
+        ]
+        gt_masks_list = [
+            gt_instances['masks'] for gt_instances in batch_gt_instances
+        ]
+        gt_semantic_segs = [
+            None if gt_semantic_seg is None else gt_semantic_seg.sem_seg
+            for gt_semantic_seg in batch_gt_semantic_segs
+        ]
+        targets = multi_apply(preprocess_panoptic_gt, gt_labels_list,
+                              gt_masks_list, gt_semantic_segs, num_things_list,
+                              num_stuff_list)
+        labels, masks = targets
+        batch_gt_instances = [
+            InstanceData(labels=label, masks=mask)
+            for label, mask in zip(labels, masks)
+        ]
+        return batch_gt_instances
+
+    def loss(self, x: Tensor, batch_data_samples: SampleList) -> dict:
         """Perform forward propagation and loss calculation of the detection
         head on the features of the upstream network.
 
         Args:
-            hidden_states (Tensor): Feature from the transformer decoder, has
+            x (Tensor): Feature from the transformer decoder, has
                 shape (num_decoder_layers, bs, num_queries, cls_out_channels)
                 or (num_decoder_layers, num_queries, bs, cls_out_channels).
             batch_data_samples (List[:obj:`DetDataSample`]): The Data
@@ -181,19 +326,32 @@ class DVISHead(BaseModule):
         """
         batch_gt_instances = []
         batch_img_metas = []
+        batch_gt_semantic_segs = []
         for data_sample in batch_data_samples:
             batch_img_metas.append(data_sample.metainfo)
             batch_gt_instances.append(data_sample.gt_instances)
+            if 'gt_sem_seg' in data_sample:
+                batch_gt_semantic_segs.append(data_sample.gt_sem_seg)
+            else:
+                batch_gt_semantic_segs.append(None)
 
-        outs = self(hidden_states)
-        loss_inputs = outs + (batch_gt_instances, batch_img_metas)
-        losses = self.loss_by_feat(*loss_inputs)
-        return losses
+        # forward
+        mask_features, norms, saliency = self(x, batch_data_samples)
+
+        # preprocess ground truth
+        batch_gt_instances = self.preprocess_gt(batch_gt_instances,
+                                                batch_gt_semantic_segs)
+
+        losses = self.loss_by_feat(mask_features, norms, saliency,
+                                   batch_gt_instances, batch_img_metas)
+
+        return losses, mask_features, norms, saliency
 
     def loss_by_feat(
         self,
-        all_layers_cls_scores: Tensor,
-        all_layers_bbox_preds: Tensor,
+        mask_features: Tensor,
+        norms: Tensor,
+        saliency: Tensor,
         batch_gt_instances: InstanceList,
         batch_img_metas: List[dict],
         batch_gt_instances_ignore: OptInstanceList = None
@@ -228,30 +386,30 @@ class DVISHead(BaseModule):
             f'{self.__class__.__name__} only supports ' \
             'for batch_gt_instances_ignore setting to None.'
 
-        losses_cls, losses_bbox, losses_iou = multi_apply(
-            self.loss_by_feat_single,
-            all_layers_cls_scores,
-            all_layers_bbox_preds,
-            batch_gt_instances=batch_gt_instances,
-            batch_img_metas=batch_img_metas)
+        losses_saliency, losses_pairwise = multi_apply(
+            self.loss_by_feat_single, mask_features, norms, saliency,
+            batch_gt_instances, batch_img_metas)
 
         loss_dict = dict()
+        loss_dict['loss_saliency'] = losses_saliency[-1]
+        loss_dict['loss_pairwise'] = losses_pairwise[-1]
+
         # loss from the last decoder layer
-        loss_dict['loss_cls'] = losses_cls[-1]
-        loss_dict['loss_bbox'] = losses_bbox[-1]
-        loss_dict['loss_iou'] = losses_iou[-1]
-        # loss from other decoder layers
-        num_dec_layer = 0
-        for loss_cls_i, loss_bbox_i, loss_iou_i in \
-                zip(losses_cls[:-1], losses_bbox[:-1], losses_iou[:-1]):
-            loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
-            loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
-            loss_dict[f'd{num_dec_layer}.loss_iou'] = loss_iou_i
-            num_dec_layer += 1
+        # loss_dict['loss_cls'] = losses_cls[-1]
+        # loss_dict['loss_bbox'] = losses_bbox[-1]
+        # loss_dict['loss_iou'] = losses_iou[-1]
+        # # loss from other decoder layers
+        # num_dec_layer = 0
+        # for loss_cls_i, loss_bbox_i, loss_iou_i in \
+        #         zip(losses_cls[:-1], losses_bbox[:-1], losses_iou[:-1]):
+        #     loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
+        #     loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
+        #     loss_dict[f'd{num_dec_layer}.loss_iou'] = loss_iou_i
+        #     num_dec_layer += 1
         return loss_dict
 
-    def loss_by_feat_single(self, cls_scores: Tensor, bbox_preds: Tensor,
-                            batch_gt_instances: InstanceList,
+    def loss_by_feat_single(self, mask_feat: Tensor, norms: Tensor,
+                            saliency: Tensor, bathc_gt_instances: InstanceList,
                             batch_img_metas: List[dict]) -> Tuple[Tensor]:
         """Loss function for outputs from a single decoder layer of a single
         feature level.
@@ -272,79 +430,154 @@ class DVISHead(BaseModule):
             Tuple[Tensor]: A tuple including `loss_cls`, `loss_box` and
             `loss_iou`.
         """
-        num_imgs = cls_scores.size(0)
-        cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
-        bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
-        cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
-                                           batch_gt_instances, batch_img_metas)
-        (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
-         num_total_pos, num_total_neg) = cls_reg_targets
-        labels = torch.cat(labels_list, 0)
-        label_weights = torch.cat(label_weights_list, 0)
-        bbox_targets = torch.cat(bbox_targets_list, 0)
-        bbox_weights = torch.cat(bbox_weights_list, 0)
 
-        # classification loss
-        cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
-        # construct weighted avg_factor to match with the official DETR repo
-        cls_avg_factor = num_total_pos * 1.0 + \
-            num_total_neg * self.bg_cls_weight
-        if self.sync_cls_avg_factor:
-            cls_avg_factor = reduce_mean(
-                cls_scores.new_tensor([cls_avg_factor]))
-        cls_avg_factor = max(cls_avg_factor, 1)
+        # downsample ground truth mask to match predicted shape
+        with torch.no_grad():
+            gt_masks = bathc_gt_instances.masks
+            # gt_labels = bathc_gt_instances.labels
 
-        if isinstance(self.loss_cls, QualityFocalLoss):
-            bg_class_ind = self.num_classes
-            pos_inds = ((labels >= 0)
-                        & (labels < bg_class_ind)).nonzero().squeeze(1)
-            scores = label_weights.new_zeros(labels.shape)
-            pos_bbox_targets = bbox_targets[pos_inds]
-            pos_decode_bbox_targets = bbox_cxcywh_to_xyxy(pos_bbox_targets)
-            pos_bbox_pred = bbox_preds.reshape(-1, 4)[pos_inds]
-            pos_decode_bbox_pred = bbox_cxcywh_to_xyxy(pos_bbox_pred)
-            scores[pos_inds] = bbox_overlaps(
-                pos_decode_bbox_pred.detach(),
-                pos_decode_bbox_targets,
-                is_aligned=True)
-            loss_cls = self.loss_cls(
-                cls_scores, (labels, scores),
-                label_weights,
-                avg_factor=cls_avg_factor)
-        else:
-            loss_cls = self.loss_cls(
-                cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
+            target_shape = mask_feat.shape[-2:]
+            has_masks = True
+            if gt_masks.shape[0] > 0:
+                gt_masks_downsampled: torch.Tensor = F.interpolate(
+                    gt_masks.unsqueeze(1).float(),
+                    target_shape,
+                    mode='nearest').squeeze(1).long()
 
-        # Compute the average number of gt boxes across all gpus, for
-        # normalization purposes
-        num_total_pos = loss_cls.new_tensor([num_total_pos])
-        num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
+                # create background "mask"
+                # any foreground gt should have value above 0.5
+                bg_mask = torch.ones((1, *gt_masks_downsampled.shape[1:]),
+                                     device=gt_masks_downsampled.device,
+                                     dtype=torch.float) * 0.5
 
-        # construct factors used for rescale bboxes
-        factors = []
-        for img_meta, bbox_pred in zip(batch_img_metas, bbox_preds):
-            img_h, img_w, = img_meta['img_shape']
-            factor = bbox_pred.new_tensor([img_w, img_h, img_w,
-                                           img_h]).unsqueeze(0).repeat(
-                                               bbox_pred.size(0), 1)
-            factors.append(factor)
-        factors = torch.cat(factors, 0)
+                # get index where 0 is background
+                gt_ind_masks = torch.concat(
+                    [bg_mask, gt_masks_downsampled.float()]).argmax(
+                        dim=0, keepdim=True)
+                gt_saliency = (gt_ind_masks > 0).bool()
 
-        # DETR regress the relative position of boxes (cxcywh) in the image,
-        # thus the learning target is normalized by the image size. So here
-        # we need to re-scale them for calculating IoU loss
-        bbox_preds = bbox_preds.reshape(-1, 4)
-        bboxes = bbox_cxcywh_to_xyxy(bbox_preds) * factors
-        bboxes_gt = bbox_cxcywh_to_xyxy(bbox_targets) * factors
+                # create the instance weighting based on instance area
+                mask_areas = gt_masks_downsampled.sum(dim=(1, 2))
 
-        # regression IoU loss, defaultly GIoU loss
-        loss_iou = self.loss_iou(
-            bboxes, bboxes_gt, bbox_weights, avg_factor=num_total_pos)
+                # calculate background area weight
+                total_area = np.prod(target_shape)
+                bg_area = (total_area - mask_areas.sum()).view((1, ))
+                mask_areas = torch.concat([bg_area, mask_areas], dim=0).float()
+                mask_weights = mask_areas / torch.linalg.vector_norm(
+                    mask_areas, ord=2)
+            else:
+                gt_masks_downsampled: torch.Tensor = gt_masks
+                gt_saliency = torch.zeros_like(
+                    norms, dtype=torch.bool)  # nothing predicted
+                has_masks = False
 
-        # regression L1 loss
-        loss_bbox = self.loss_bbox(
-            bbox_preds, bbox_targets, bbox_weights, avg_factor=num_total_pos)
-        return loss_cls, loss_bbox, loss_iou
+        # @TODO DAVID IDEA
+        # test difference between using a global saliency mask using CE
+        # and then a version where we only apply CE within each ground
+        # truth object bbox where each bbox is equally weighted and
+        # ignore any other region this should promote smaller
+        # objects/more proposals
+
+        # saliency loss
+        loss_saliency = torch.binary_cross_entropy_with_logits(
+            input=saliency,
+            target=gt_saliency.float(),
+            # weight=
+        )
+
+        # apply foreground terms
+        if has_masks:
+            sample_points = 1500
+            pred_flatten = mask_feat.permute(1, 2,
+                                             0).view(-1, mask_feat.shape[0])
+            norm_flatten = norms.permute(1, 2, 0).view(pred_flatten.shape[0],
+                                                       1)
+            gt_ind_flatten = gt_ind_masks.ravel()
+
+            # get agreed foreground pixels. As in where
+            # model predicts foreground (high confidence) and ground truth
+            # agrees it is foreground we use these points to push instance
+            # labels together/apart
+            foreground_filter = 0.15
+            gt_ind_flatten[torch.sigmoid(norm_flatten).squeeze() <
+                           foreground_filter] = 0  # zero out model low scores
+            gt_foreground_ind = gt_ind_flatten.nonzero()
+
+            # if non then skip
+            num_fg = gt_foreground_ind.numel()
+            if num_fg < 3:
+                has_masks = False  # in fact no gt masks with agreement
+            else:
+                # randomly select foreground pixels (up to sample points)
+                perm = torch.randperm(
+                    num_fg, device=gt_foreground_ind.device)[:sample_points]
+                fg_pts = gt_foreground_ind[perm].squeeze(
+                )  # get the indices of the sampled points
+                # print(perm, perm.shape)
+                # print(fg_pts, fg_pts.shape)
+                num_fg = perm.shape[0]
+
+                # select the sampled pixels
+                # print(pred_flatten.shape)
+                pred_fg = pred_flatten[fg_pts].contiguous()
+                norm_fg = norm_flatten[fg_pts].contiguous()
+                gt_fg = gt_ind_flatten[fg_pts].contiguous()
+
+                # get pairwise hamming distance as an indicator of
+                # within same instance or not (hamming distance simple enough)
+                diff_indicator = torch.pdist(
+                    gt_fg.unsqueeze(1).float(), p=0).detach()
+
+                # get pairwise indices
+                pairwise_ind = torch.triu_indices(
+                    num_fg, num_fg, offset=1, device=diff_indicator.device)
+
+                # project fg vectors to hypersphere
+                pred_hyper = pred_fg / norm_fg  # we know all
+                # norms now are above "foreground_filter"
+
+                # compute pairwise cosine similarity
+                pred_cossim = pred_hyper.matmul(
+                    pred_hyper.t().detach())[pairwise_ind[0],
+                                             pairwise_ind[1]].ravel()
+
+                # pairwise weight is instance weighting between pairs
+                fg_weights: torch.Tensor = mask_weights[gt_fg].view(num_fg, 1)
+
+                pairwise_weight = fg_weights.matmul(
+                    fg_weights.t())[pairwise_ind[0], pairwise_ind[1]].ravel()
+                pairwise_weight = (pairwise_weight / torch.linalg.vector_norm(
+                    pairwise_weight,
+                    ord=2)).detach()  # normalize by pairwise instance weights
+                # @ TODO see if this is necessary
+
+                # compute similarity
+                # pred_sim = 0.5 * (1 + pred_cossim)
+
+                # hyperspherical energy for diff points
+                geodesics = torch.arccos(pred_cossim / (1.0 + 0.05))
+                hyper_same_energy = torch.square(geodesics)
+                smooth = 1e-7
+                hyper_diff_energy = (1.0 + smooth) / (
+                    hyper_same_energy + smooth)
+
+                # loss is to max cossim of similar instances and min cossim
+                # (with some margin) of different instances
+                # margin = np.arccos(0.4)
+                # @TODO make the margin part of config
+                # print('num sim', (1.0 - diff_indicator).count_nonzero(),
+                # 'num diff' , (diff_indicator).count_nonzero())
+                loss_pairwise = 800 * pairwise_weight * (
+                    (1.0 - diff_indicator) * hyper_same_energy +
+                    (diff_indicator *
+                     (geodesics < 0.5).detach() * hyper_diff_energy)
+                )  # (((1.0 - diff_indicator) * (1.0 - pred_sim))
+                # + (diff_indicator * torch.relu(pred_sim - margin)))
+        if not has_masks:
+            loss_pairwise = torch.tensor(
+                0.0, dtype=torch.float, device=loss_saliency.device)
+
+        return loss_saliency, loss_pairwise
 
     def get_targets(self, cls_scores_list: List[Tensor],
                     bbox_preds_list: List[Tensor],

@@ -28,8 +28,7 @@ model = dict(
         score_thr=0.05,
         nms=dict(type='nms', iou_threshold=0.6),
         max_per_img=100,
-        mask_thr_binary=0.5),
-)
+        mask_thr_binary=0.5), )
 
 train_pipeline = [
     dict(type='LoadImageFromFile', backend_args={{_base_.backend_args}}),
@@ -38,7 +37,7 @@ train_pipeline = [
         with_bbox=True,
         with_mask=True,
         poly2mask=False),
-    dict(type='CachedMosaic', img_scale=(640, 640), pad_val=114.0),
+    # dict(type='CachedMosaic', img_scale=(640, 640), pad_val=114.0),
     dict(
         type='RandomResize',
         scale=(1280, 1280),
@@ -52,12 +51,12 @@ train_pipeline = [
     dict(type='YOLOXHSVRandomAug'),
     dict(type='RandomFlip', prob=0.5),
     dict(type='Pad', size=(640, 640), pad_val=dict(img=(114, 114, 114))),
-    dict(
-        type='CachedMixUp',
-        img_scale=(640, 640),
-        ratio_range=(1.0, 1.0),
-        max_cached_images=20,
-        pad_val=(114, 114, 114)),
+    # dict(
+    #     type='CachedMixUp',
+    #     img_scale=(640, 640),
+    #     ratio_range=(1.0, 1.0),
+    #     max_cached_images=20,
+    #     pad_val=(114, 114, 114)),
     dict(type='FilterAnnotations', min_gt_bbox_wh=(1, 1)),
     dict(type='PackDetInputs')
 ]
