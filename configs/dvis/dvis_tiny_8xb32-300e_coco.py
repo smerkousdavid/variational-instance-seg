@@ -1,5 +1,6 @@
 _base_ = './dvis-ins_l_8xb32-300e_coco.py'
-checkpoint = 'https://download.openmmlab.com/mmdetection/v3.0/rtmdet/cspnext_rsb_pretrain/cspnext-s_imagenet_600e.pth'  # noqa
+checkpoint = 'https://download.openmmlab.com/mmdetection/v3.0/rtmdet/cspnext_rsb_pretrain/cspnext-tiny_imagenet_600e.pth'  # noqa
+
 model = dict(
     data_preprocessor=dict(
         batch_augments=None,
@@ -16,12 +17,12 @@ model = dict(
         ],
         type='DetDataPreprocessor'),
     backbone=dict(
-        deepen_factor=0.33,
-        widen_factor=0.5,
+        deepen_factor=0.167,
+        widen_factor=0.375,
         init_cfg=dict(
             type='Pretrained', prefix='backbone.', checkpoint=checkpoint)),
     # neck=dict(in_channels=[128, 256, 512], out_channels=64, num_outs=3),
-    # bbox_head=dict(in_channels=128, feat_channels=128)
+    # bbox_head=dict(in_channels=96, feat_channels=96)
 )
 
 train_pipeline = [

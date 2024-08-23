@@ -67,35 +67,35 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
         super().__init__(
             data_preprocessor=data_preprocessor, init_cfg=init_cfg)
         # process args
-        bbox_head.update(train_cfg=train_cfg)
-        bbox_head.update(test_cfg=test_cfg)
+        # bbox_head.update(train_cfg=train_cfg)
+        # bbox_head.update(test_cfg=test_cfg)
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
-        self.encoder = encoder
-        self.decoder = decoder
-        self.positional_encoding = positional_encoding
+        # self.encoder = encoder
+        # self.decoder = decoder
+        # self.positional_encoding = positional_encoding
         self.num_queries = num_queries
 
         # init model layers
         self.backbone = MODELS.build(backbone)
         if neck is not None:
             self.neck = MODELS.build(neck)
-        self.bbox_head = MODELS.build(bbox_head)
+        # self.bbox_head = MODELS.build(bbox_head)
         self.dvis_head = MODELS.build(dvis_head)
-        self._init_layers()
+        # self._init_layers()
 
     # @abstractmethod
-    def _init_layers(self) -> None:
-        """Initialize layers except for backbone, neck and bbox_head."""
-        self.positional_encoding = SinePositionalEncoding(
-            **self.positional_encoding)
-        self.encoder = DetrTransformerEncoder(**self.encoder)
-        self.embed_dims = self.encoder.embed_dims
+    # def _init_layers(self) -> None:
+    #     """Initialize layers except for backbone, neck and bbox_head."""
+    #     self.positional_encoding = SinePositionalEncoding(
+    #         **self.positional_encoding)
+    #     self.encoder = DetrTransformerEncoder(**self.encoder)
+    #     self.embed_dims = self.encoder.embed_dims
 
-        num_feats = self.positional_encoding.num_feats
-        assert num_feats * 2 == self.embed_dims, \
-            'embed_dims should be exactly 2 times of num_feats. ' \
-            f'Found {self.embed_dims} and {num_feats}.'
+    #     num_feats = self.positional_encoding.num_feats
+    #     assert num_feats * 2 == self.embed_dims, \
+    #         'embed_dims should be exactly 2 times of num_feats. ' \
+    #         f'Found {self.embed_dims} and {num_feats}.'
 
     def pre_transformer(
             self,

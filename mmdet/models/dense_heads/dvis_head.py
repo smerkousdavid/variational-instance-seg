@@ -130,7 +130,7 @@ class DVISHead(BaseModule):
         self.num_things_classes = num_things_classes
         self.num_stuff_classes = num_stuff_classes
         self.num_classes = self.num_things_classes + self.num_stuff_classes
-        class_weight = loss_cls.get('class_weight', None)
+        class_weight = None  # loss_cls.get('class_weight', None)
         if class_weight is not None and (self.__class__ is DVISHead):
             assert isinstance(class_weight, float), 'Expected ' \
                 'class_weight to have type float. Found ' \
@@ -161,9 +161,9 @@ class DVISHead(BaseModule):
         self.num_reg_fcs = num_reg_fcs
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
-        self.loss_cls = MODELS.build(loss_cls)
-        self.loss_bbox = MODELS.build(loss_bbox)
-        self.loss_iou = MODELS.build(loss_iou)
+        # self.loss_cls = MODELS.build(loss_cls)
+        # self.loss_bbox = MODELS.build(loss_bbox)
+        # self.loss_iou = MODELS.build(loss_iou)
 
         # assert pixel_decoder.encoder.layer_cfg. \
         #     self_attn_cfg.num_levels == num_transformer_feat_level
@@ -182,12 +182,12 @@ class DVISHead(BaseModule):
         # else:
         self.decoder_input_proj = nn.Identity()
 
-        if self.loss_cls.use_sigmoid:
-            self.cls_out_channels = num_classes
-        else:
-            self.cls_out_channels = num_classes + 1
+        # if self.loss_cls.use_sigmoid:
+        #     self.cls_out_channels = num_classes
+        # else:
+        #     self.cls_out_channels = num_classes + 1
 
-        self._init_layers()
+        # self._init_layers()
 
     def init_weights(self) -> None:
         if isinstance(self.decoder_input_proj, Conv2d):
@@ -195,23 +195,23 @@ class DVISHead(BaseModule):
 
         self.pixel_decoder.init_weights()
 
-    def _init_layers(self) -> None:
-        """Initialize layers of the transformer head."""
-        # cls branch
-        self.fc_cls = Linear(self.embed_dims, self.cls_out_channels)
-        # reg branch
-        self.activate = nn.ReLU()
-        self.reg_ffn = FFN(
-            self.embed_dims,
-            self.embed_dims,
-            self.num_reg_fcs,
-            dict(type='ReLU', inplace=True),
-            dropout=0.0,
-            add_residual=False)
-        # NOTE the activations of reg_branch here is the same as
-        # those in transformer, but they are actually different
-        # in DAB-DETR (prelu in transformer and relu in reg_branch)
-        self.fc_reg = Linear(self.embed_dims, 4)
+    # def _init_layers(self) -> None:
+    #     """Initialize layers of the transformer head."""
+    #     # cls branch
+    #     self.fc_cls = Linear(self.embed_dims, self.cls_out_channels)
+    #     # reg branch
+    #     self.activate = nn.ReLU()
+    #     self.reg_ffn = FFN(
+    #         self.embed_dims,
+    #         self.embed_dims,
+    #         self.num_reg_fcs,
+    #         dict(type='ReLU', inplace=True),
+    #         dropout=0.0,
+    #         add_residual=False)
+    #     # NOTE the activations of reg_branch here is the same as
+    #     # those in transformer, but they are actually different
+    #     # in DAB-DETR (prelu in transformer and relu in reg_branch)
+    #     self.fc_reg = Linear(self.embed_dims, 4)
 
     def forward(self, x: Tuple[Tensor],
                 batch_data_samples: SampleList) -> Tuple[Tensor]:
@@ -431,6 +431,15 @@ class DVISHead(BaseModule):
             `loss_iou`.
         """
 
+        # @TODO DAVID IDEA
+        # test difference between using a global saliency mask using CE
+        # and then a version where we only apply CE within each ground
+        # truth object bbox where each bbox is equally weighted and
+        # ignore any other region this should promote smaller
+        # objects/more proposals
+        # GLOBAL = False
+        BG_WEIGHT = 0.3  # reweight background by this area
+
         # downsample ground truth mask to match predicted shape
         with torch.no_grad():
             gt_masks = bathc_gt_instances.masks
@@ -464,34 +473,35 @@ class DVISHead(BaseModule):
                 bg_area = (total_area - mask_areas.sum()).view((1, ))
                 mask_areas = torch.concat([bg_area, mask_areas], dim=0).float()
                 mask_weights = mask_areas / torch.linalg.vector_norm(
-                    mask_areas, ord=2)
+                    mask_areas, ord=2) # [gt]
+                mask_weights[0] *= BG_WEIGHT
+                
+                # mask_weights is currently [gt] convert to single full mask with each weight
+                weighted_saliency = mask_weights[gt_ind_masks]  # now [bs, h, w] with each element being the weight of mask from index in gt_ind_masks
             else:
                 gt_masks_downsampled: torch.Tensor = gt_masks
                 gt_saliency = torch.zeros_like(
                     norms, dtype=torch.bool)  # nothing predicted
+                weighted_saliency = torch.ones_like(gt_saliency) * BG_WEIGHT  # all background weighting
                 has_masks = False
 
-        # @TODO DAVID IDEA
-        # test difference between using a global saliency mask using CE
-        # and then a version where we only apply CE within each ground
-        # truth object bbox where each bbox is equally weighted and
-        # ignore any other region this should promote smaller
-        # objects/more proposals
 
         # saliency loss
+        # print('INPUT', saliency.shape, gt_saliency.shape, mask_weights.shape)
+        
         loss_saliency = torch.binary_cross_entropy_with_logits(
-            input=saliency,
-            target=gt_saliency.float(),
-            # weight=
+            input=saliency,  # [bs, h, w]
+            target=gt_saliency.float(),  # [bs, h, w]
+            weight=weighted_saliency  # broadcastable to [bs, h, w]
         )
 
         # apply foreground terms
         if has_masks:
             sample_points = 1500
-            pred_flatten = mask_feat.permute(1, 2,
-                                             0).view(-1, mask_feat.shape[0])
-            norm_flatten = norms.permute(1, 2, 0).view(pred_flatten.shape[0],
-                                                       1)
+            pred_flatten = mask_feat.permute(1, 2, 0) \
+                        .view(-1, mask_feat.shape[0])
+            norm_flatten = norms.permute(1, 2, 0) \
+                        .view(pred_flatten.shape[0], 1)
             gt_ind_flatten = gt_ind_masks.ravel()
 
             # get agreed foreground pixels. As in where
@@ -567,11 +577,14 @@ class DVISHead(BaseModule):
                 # @TODO make the margin part of config
                 # print('num sim', (1.0 - diff_indicator).count_nonzero(),
                 # 'num diff' , (diff_indicator).count_nonzero())
-                loss_pairwise = 800 * pairwise_weight * (
-                    (1.0 - diff_indicator) * hyper_same_energy +
+                weight_same = 1.3
+                weight_diff = 0.9
+                loss_pairwise = 900 * pairwise_weight * (
+                    (1.0 - diff_indicator) * weight_same * hyper_same_energy +
                     (diff_indicator *
-                     (geodesics < 0.5).detach() * hyper_diff_energy)
-                )  # (((1.0 - diff_indicator) * (1.0 - pred_sim))
+                     (geodesics < 0.5).detach() * weight_diff * hyper_diff_energy)
+                )
+                # (((1.0 - diff_indicator) * (1.0 - pred_sim))
                 # + (diff_indicator * torch.relu(pred_sim - margin)))
         if not has_masks:
             loss_pairwise = torch.tensor(
@@ -836,6 +849,7 @@ class DVISHead(BaseModule):
                 - bboxes (Tensor): Has a shape (num_instances, 4),
                   the last dimension 4 arrange as (x1, y1, x2, y2).
         """
+        raise NotImplementedError('not done yet')
         assert len(cls_score) == len(bbox_pred)  # num_queries
         max_per_img = self.test_cfg.get('max_per_img', len(cls_score))
         img_shape = img_meta['img_shape']
