@@ -55,9 +55,10 @@ model = dict(
     dvis_head=dict(
         type='DVISHead',
         num_classes=80,
-        in_channels=[64, 128, 256, 512], # TINY [48, 96, 192, 384],  # [128, 256, 512, 1024],
+        in_channels=[64, 128, 256, 512
+                     ],  # TINY [48, 96, 192, 384],  # [128, 256, 512, 1024],
         feat_channels=256,  # SMALL 256
-        out_channels=16,
+        out_channels=9,  # 16,
         pixel_decoder=dict(
             type='TransformerEncoderPixelDecoder',
             norm_cfg=dict(type='GN', num_groups=32),
@@ -170,10 +171,10 @@ val_dataloader = dict(
     batch_size=5, num_workers=10, dataset=dict(pipeline=test_pipeline))
 test_dataloader = val_dataloader
 
-max_epochs = 300
+max_epochs = 200  # 300
 stage2_num_epochs = 20
-base_lr = 5 * 2.0e-5  # 0.004
-interval = 100000  # @TODO PUT BACK 10
+base_lr = 4 * 2.0e-5  # 0.004
+interval = 1
 
 train_cfg = dict(
     max_epochs=max_epochs,

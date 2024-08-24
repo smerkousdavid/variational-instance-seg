@@ -20,6 +20,7 @@ from mmdet.utils import (ConfigType, InstanceList, OptInstanceList,
                          OptMultiConfig)
 # from ..losses import QualityFocalLoss
 from ..utils import multi_apply
+from ..utils.mean_shift import clustering_features
 
 
 def preprocess_panoptic_gt(gt_labels: Tensor, gt_masks: Tensor,
@@ -171,7 +172,8 @@ class DVISHead(BaseModule):
         pixel_decoder_.update(
             in_channels=in_channels,
             feat_channels=feat_channels,
-            out_channels=out_channels)
+            out_channels=2 * out_channels)
+        self.hyper_dim = out_channels
         self.pixel_decoder = MODELS.build(pixel_decoder_)
 
         # if isinstance(self.pixel_decoder, PixelDecoder) and (
@@ -182,6 +184,32 @@ class DVISHead(BaseModule):
         # else:
         self.decoder_input_proj = nn.Identity()
 
+        # load anchor points and construct weights
+        anchor_data = torch.load('discrete_points_9.pth')
+        self.margin = anchor_data['margin'].cuda()
+        self.anchors = anchor_data['anchors'].cuda(
+        )  # shape of [anchors, feat_dim]
+        self.anchor_weights = self.anchors.view(self.anchors.shape[0],
+                                                self.anchors.shape[1], 1, 1)
+        self.anchor_conv = Conv2d(
+            self.anchor_weights.shape[1],
+            self.anchor_weights.shape[0],
+            kernel_size=1,
+            bias=False,
+            padding=0)
+        self.anchor_conv.weight = nn.Parameter(
+            self.anchor_weights, requires_grad=False)
+
+        # create the learnable classification anchors
+        with torch.no_grad():
+            init_cls = torch.empty(self.num_classes,
+                                   self.anchors.shape[1]).normal_(
+                                       mean=0.0, std=1.0).cuda()
+            init_cls /= torch.linalg.norm(init_cls, ord=2, dim=1, keepdim=True)
+            init_cls.requires_grad = True
+        self.class_anchors = nn.Parameter(init_cls)
+        # self.class_weights = self.class_anchors.view(self.class_anchors.shape[0], self.class_anchors.shape[1], 1, 1)
+        # self.class_conv = Conv2d(self.class_weights.shape[1], self.class_weights.shape[0], kernel_size=1, bias=False, padding=0)
         # if self.loss_cls.use_sigmoid:
         #     self.cls_out_channels = num_classes
         # else:
@@ -256,10 +284,12 @@ class DVISHead(BaseModule):
 
         # handle saliency via feature norms
         norms = torch.linalg.vector_norm(
-            mask_features, ord=2, dim=1, keepdim=True)
-        saliency = norms / mask_features.shape[1]
+            mask_features[:self.hyper_dim], ord=2, dim=1, keepdim=True)
+        saliency = 1.1 * norms - 4.2
 
-        return mask_features, norms, saliency  # [], []
+        return mask_features[:, :self.
+                             hyper_dim], mask_features[:, self.
+                                                       hyper_dim:], norms, saliency
 
     def preprocess_gt(
             self, batch_gt_instances: InstanceList,
@@ -336,20 +366,23 @@ class DVISHead(BaseModule):
                 batch_gt_semantic_segs.append(None)
 
         # forward
-        mask_features, norms, saliency = self(x, batch_data_samples)
+        mask_features, class_features, norms, saliency = self(
+            x, batch_data_samples)
 
         # preprocess ground truth
         batch_gt_instances = self.preprocess_gt(batch_gt_instances,
                                                 batch_gt_semantic_segs)
 
-        losses = self.loss_by_feat(mask_features, norms, saliency,
-                                   batch_gt_instances, batch_img_metas)
+        losses = self.loss_by_feat(mask_features, class_features, norms,
+                                   saliency, batch_gt_instances,
+                                   batch_img_metas)
 
         return losses, mask_features, norms, saliency
 
     def loss_by_feat(
         self,
         mask_features: Tensor,
+        class_features: Tensor,
         norms: Tensor,
         saliency: Tensor,
         batch_gt_instances: InstanceList,
@@ -386,13 +419,15 @@ class DVISHead(BaseModule):
             f'{self.__class__.__name__} only supports ' \
             'for batch_gt_instances_ignore setting to None.'
 
-        losses_saliency, losses_pairwise = multi_apply(
-            self.loss_by_feat_single, mask_features, norms, saliency,
-            batch_gt_instances, batch_img_metas)
+        losses_saliency, losses_pairwise, losses_discrete, losses_class = multi_apply(
+            self.loss_by_feat_single, mask_features, class_features, norms,
+            saliency, batch_gt_instances, batch_img_metas)
 
         loss_dict = dict()
-        loss_dict['loss_saliency'] = losses_saliency[-1]
-        loss_dict['loss_pairwise'] = losses_pairwise[-1]
+        loss_dict['loss_saliency'] = losses_saliency
+        loss_dict['loss_pairwise'] = losses_pairwise
+        loss_dict['loss_discrete'] = losses_discrete
+        loss_dict['loss_class'] = losses_class
 
         # loss from the last decoder layer
         # loss_dict['loss_cls'] = losses_cls[-1]
@@ -408,8 +443,25 @@ class DVISHead(BaseModule):
         #     num_dec_layer += 1
         return loss_dict
 
-    def loss_by_feat_single(self, mask_feat: Tensor, norms: Tensor,
-                            saliency: Tensor, bathc_gt_instances: InstanceList,
+    def discretize(self, feats):
+        # feats of shape [c, h, w]
+        return self.anchor_conv(feats.unsqueeze(0)).squeeze(0).argmax(dim=0)
+
+    def batch_discretize(self, feats):
+        # feats of shape [c, h, w]
+        return self.anchor_conv(feats.unsqueeze(0)).squeeze(0).argmax(dim=0)
+
+    def classify(self, feats):
+        # feats of shape [c, h, w]
+        return torch.nn.functional.conv2d(
+            feats.unsqueeze(0),
+            weight=self.class_anchors.view(self.class_anchors.shape[0],
+                                           self.class_anchors.shape[1], 1,
+                                           1)).squeeze(0)
+
+    def loss_by_feat_single(self, mask_feat: Tensor, class_feat: Tensor,
+                            norms: Tensor, saliency: Tensor,
+                            bathc_gt_instances: InstanceList,
                             batch_img_metas: List[dict]) -> Tuple[Tensor]:
         """Loss function for outputs from a single decoder layer of a single
         feature level.
@@ -438,12 +490,12 @@ class DVISHead(BaseModule):
         # ignore any other region this should promote smaller
         # objects/more proposals
         # GLOBAL = False
-        BG_WEIGHT = 0.3  # reweight background by this area
+        BG_WEIGHT = 1.0  # reweight background by this area
 
         # downsample ground truth mask to match predicted shape
         with torch.no_grad():
             gt_masks = bathc_gt_instances.masks
-            # gt_labels = bathc_gt_instances.labels
+            gt_labels = bathc_gt_instances.labels
 
             target_shape = mask_feat.shape[-2:]
             has_masks = True
@@ -473,22 +525,22 @@ class DVISHead(BaseModule):
                 bg_area = (total_area - mask_areas.sum()).view((1, ))
                 mask_areas = torch.concat([bg_area, mask_areas], dim=0).float()
                 mask_weights = mask_areas / torch.linalg.vector_norm(
-                    mask_areas, ord=2) # [gt]
+                    mask_areas, ord=2)  # [gt]
                 mask_weights[0] *= BG_WEIGHT
-                
+
                 # mask_weights is currently [gt] convert to single full mask with each weight
-                weighted_saliency = mask_weights[gt_ind_masks]  # now [bs, h, w] with each element being the weight of mask from index in gt_ind_masks
+                weighted_saliency = mask_weights[
+                    gt_ind_masks]  # now [bs, h, w] with each element being the weight of mask from index in gt_ind_masks
             else:
                 gt_masks_downsampled: torch.Tensor = gt_masks
                 gt_saliency = torch.zeros_like(
                     norms, dtype=torch.bool)  # nothing predicted
-                weighted_saliency = torch.ones_like(gt_saliency) * BG_WEIGHT  # all background weighting
+                weighted_saliency = torch.ones_like(
+                    gt_saliency) * BG_WEIGHT  # all background weighting
                 has_masks = False
-
 
         # saliency loss
         # print('INPUT', saliency.shape, gt_saliency.shape, mask_weights.shape)
-        
         loss_saliency = torch.binary_cross_entropy_with_logits(
             input=saliency,  # [bs, h, w]
             target=gt_saliency.float(),  # [bs, h, w]
@@ -500,9 +552,17 @@ class DVISHead(BaseModule):
             sample_points = 1500
             pred_flatten = mask_feat.permute(1, 2, 0) \
                         .view(-1, mask_feat.shape[0])
+            cls_flatten = class_feat.permute(1, 2, 0) \
+                        .view(-1, class_feat.shape[0])
             norm_flatten = norms.permute(1, 2, 0) \
                         .view(pred_flatten.shape[0], 1)
             gt_ind_flatten = gt_ind_masks.ravel()
+
+            # calculate class norms
+            cls_norms = torch.linalg.vector_norm(
+                class_feat, ord=2, dim=0, keepdim=True)
+            cls_norm_flatten = cls_norms.permute(1, 2, 0) \
+                        .view(cls_flatten.shape[0], 1)
 
             # get agreed foreground pixels. As in where
             # model predicts foreground (high confidence) and ground truth
@@ -530,7 +590,9 @@ class DVISHead(BaseModule):
                 # select the sampled pixels
                 # print(pred_flatten.shape)
                 pred_fg = pred_flatten[fg_pts].contiguous()
+                cls_fg = cls_flatten[fg_pts].contiguous()
                 norm_fg = norm_flatten[fg_pts].contiguous()
+                cls_norm_fg = cls_norm_flatten[fg_pts].contiguous()
                 gt_fg = gt_ind_flatten[fg_pts].contiguous()
 
                 # get pairwise hamming distance as an indicator of
@@ -543,13 +605,58 @@ class DVISHead(BaseModule):
                     num_fg, num_fg, offset=1, device=diff_indicator.device)
 
                 # project fg vectors to hypersphere
-                pred_hyper = pred_fg / norm_fg  # we know all
-                # norms now are above "foreground_filter"
+                pred_hyper = pred_fg / norm_fg
+                cls_hyper = cls_fg / cls_norm_fg
+                # norms now are above "foreground_filter" so no epsilon needed
 
                 # compute pairwise cosine similarity
                 pred_cossim = pred_hyper.matmul(
                     pred_hyper.t().detach())[pairwise_ind[0],
                                              pairwise_ind[1]].ravel()
+
+                # compute anchor similarity (anchors already on hypersphere)
+                # anchor_sim = pred_hyper.matmul(self.anchors.t().detach())
+
+                # get average anchor and move towards an anchor
+                # to get a more discrete representation
+                usable_ind = torch.unique(gt_fg)
+                loss_discrete = 0.0
+                loss_class = 0.0
+                for ind in usable_ind:
+                    # move mask mean embedding to anchor
+                    mean = pred_hyper[gt_fg == ind].mean(
+                        dim=0, keepdim=True)  # now [1, feat_dim]
+                    mean = mean / (
+                        torch.linalg.vector_norm(mean, ord=2) + 1e-5)
+
+                    # get most similar anchor
+                    # print(mean.shape, self.anchors.shape)
+                    anchor_sim_ind = mean.matmul(
+                        self.anchors.t().detach()).argmax(dim=1).squeeze()
+                    # print(mean.matmul(self.anchors.t().detach()).squeeze().shape, mean.matmul(self.anchors.t().detach()).max())
+
+                    # move mean towards anchor
+                    cosim = self.anchors[anchor_sim_ind].unsqueeze(0).matmul(
+                        mean.t().detach()).squeeze()
+                    # geod = torch.arccos(cosim / (1.0 + 0.05))
+                    loss_discrete += 0.1 * (1.0 - cosim)
+
+                    # now move the class points towards the anchor of all foreground points
+                    clust = cls_hyper[
+                        gt_fg ==
+                        ind]  # [N, feat_dim] where N is number of sampled foreground mask points
+
+                    # move towards target class by label
+                    target_class = self.class_anchors[gt_labels[
+                        ind - 1]]  # backshift by 1 to ignore background
+                    target_class = target_class / torch.linalg.vector_norm(
+                        target_class, ord=2)
+                    cls_cosim = target_class.unsqueeze(0).matmul(
+                        clust.t().detach())
+                    loss_class += 5.0 * (1.0 - cls_cosim.mean())
+
+                loss_discrete /= usable_ind.numel()
+                loss_class /= usable_ind.numel()
 
                 # pairwise weight is instance weighting between pairs
                 fg_weights: torch.Tensor = mask_weights[gt_fg].view(num_fg, 1)
@@ -577,20 +684,23 @@ class DVISHead(BaseModule):
                 # @TODO make the margin part of config
                 # print('num sim', (1.0 - diff_indicator).count_nonzero(),
                 # 'num diff' , (diff_indicator).count_nonzero())
-                weight_same = 1.3
-                weight_diff = 0.9
+                weight_same = 1.0
+                weight_diff = 1.0
                 loss_pairwise = 900 * pairwise_weight * (
                     (1.0 - diff_indicator) * weight_same * hyper_same_energy +
-                    (diff_indicator *
-                     (geodesics < 0.5).detach() * weight_diff * hyper_diff_energy)
-                )
+                    (diff_indicator * (pred_cossim < self.margin).detach() *
+                     weight_diff * hyper_diff_energy))
                 # (((1.0 - diff_indicator) * (1.0 - pred_sim))
                 # + (diff_indicator * torch.relu(pred_sim - margin)))
         if not has_masks:
             loss_pairwise = torch.tensor(
                 0.0, dtype=torch.float, device=loss_saliency.device)
+            loss_discrete = torch.tensor(
+                0.0, dtype=torch.float, device=loss_saliency.device)
+            loss_class = torch.tensor(
+                0.0, dtype=torch.float, device=loss_saliency.device)
 
-        return loss_saliency, loss_pairwise
+        return loss_saliency, loss_pairwise, loss_discrete, loss_class
 
     def get_targets(self, cls_scores_list: List[Tensor],
                     bbox_preds_list: List[Tensor],
@@ -707,7 +817,7 @@ class DVISHead(BaseModule):
                 neg_inds)
 
     def loss_and_predict(
-            self, hidden_states: Tuple[Tensor],
+            self, x: Tuple[Tensor],
             batch_data_samples: SampleList) -> Tuple[dict, InstanceList]:
         """Perform forward propagation of the head, then calculate loss and
         predictions from the features and data samples. Over-write because
@@ -729,20 +839,33 @@ class DVISHead(BaseModule):
         """
         batch_gt_instances = []
         batch_img_metas = []
+        batch_gt_semantic_segs = []
         for data_sample in batch_data_samples:
             batch_img_metas.append(data_sample.metainfo)
             batch_gt_instances.append(data_sample.gt_instances)
+            if 'gt_sem_seg' in data_sample:
+                batch_gt_semantic_segs.append(data_sample.gt_sem_seg)
+            else:
+                batch_gt_semantic_segs.append(None)
 
-        outs = self(hidden_states)
-        loss_inputs = outs + (batch_gt_instances, batch_img_metas)
-        losses = self.loss_by_feat(*loss_inputs)
+        # forward
+        mask_features, class_features, norms, saliency = self(
+            x, batch_data_samples)
 
-        predictions = self.predict_by_feat(
-            *outs, batch_img_metas=batch_img_metas)
+        # preprocess ground truth
+        batch_gt_instances = self.preprocess_gt(batch_gt_instances,
+                                                batch_gt_semantic_segs)
+
+        losses = self.loss_by_feat(mask_features, class_features, norms,
+                                   saliency, batch_gt_instances,
+                                   batch_img_metas)
+        predictions = self.predict_by_feat(mask_features, class_features,
+                                           norms, saliency, batch_img_metas)
+
         return losses, predictions
 
     def predict(self,
-                hidden_states: Tuple[Tensor],
+                x: Tuple[Tensor],
                 batch_data_samples: SampleList,
                 rescale: bool = True) -> InstanceList:
         """Perform forward propagation of the detection head and predict
@@ -762,21 +885,35 @@ class DVISHead(BaseModule):
             list[obj:`InstanceData`]: Detection results of each image
             after the post process.
         """
-        batch_img_metas = [
-            data_samples.metainfo for data_samples in batch_data_samples
-        ]
+        batch_img_metas = []
+        for data_sample in batch_data_samples:
+            batch_img_metas.append(data_sample.metainfo)
 
-        last_layer_hidden_state = hidden_states[-1].unsqueeze(0)
-        outs = self(last_layer_hidden_state)
+        # last_layer_hidden_state = hidden_states[-1].unsqueeze(0)
+        # outs = self(last_layer_hidden_state)
+
+        # predictions = self.predict_by_feat(
+        #     *outs, batch_img_metas=batch_img_metas, rescale=rescale)
+
+        # forward
+        mask_features, class_features, norms, saliency = self(
+            x, batch_data_samples)
 
         predictions = self.predict_by_feat(
-            *outs, batch_img_metas=batch_img_metas, rescale=rescale)
+            mask_features,
+            class_features,
+            norms,
+            saliency,
+            batch_img_metas,
+            rescale=rescale)
 
         return predictions
 
     def predict_by_feat(self,
-                        layer_cls_scores: Tensor,
-                        layer_bbox_preds: Tensor,
+                        mask_f: Tensor,
+                        class_f: Tensor,
+                        norms: Tensor,
+                        saliency: Tensor,
                         batch_img_metas: List[dict],
                         rescale: bool = True) -> InstanceList:
         """Transform network outputs for a batch into bbox predictions.
@@ -804,24 +941,23 @@ class DVISHead(BaseModule):
                 - bboxes (Tensor): Has a shape (num_instances, 4),
                   the last dimension 4 arrange as (x1, y1, x2, y2).
         """
-        # NOTE only using outputs from the last feature level,
-        # and only the outputs from the last decoder layer is used.
-        cls_scores = layer_cls_scores[-1]
-        bbox_preds = layer_bbox_preds[-1]
 
         result_list = []
         for img_id in range(len(batch_img_metas)):
-            cls_score = cls_scores[img_id]
-            bbox_pred = bbox_preds[img_id]
             img_meta = batch_img_metas[img_id]
-            results = self._predict_by_feat_single(cls_score, bbox_pred,
-                                                   img_meta, rescale)
+            results = self._predict_by_feat_single(mask_f[img_id],
+                                                   class_f[img_id],
+                                                   norms[img_id],
+                                                   saliency[img_id], img_meta,
+                                                   rescale)
             result_list.append(results)
         return result_list
 
     def _predict_by_feat_single(self,
-                                cls_score: Tensor,
-                                bbox_pred: Tensor,
+                                mask_feat: Tensor,
+                                class_feat: Tensor,
+                                norms: Tensor,
+                                saliency: Tensor,
                                 img_meta: dict,
                                 rescale: bool = True) -> InstanceData:
         """Transform outputs from the last decoder layer into bbox predictions
@@ -849,35 +985,90 @@ class DVISHead(BaseModule):
                 - bboxes (Tensor): Has a shape (num_instances, 4),
                   the last dimension 4 arrange as (x1, y1, x2, y2).
         """
-        raise NotImplementedError('not done yet')
-        assert len(cls_score) == len(bbox_pred)  # num_queries
-        max_per_img = self.test_cfg.get('max_per_img', len(cls_score))
-        img_shape = img_meta['img_shape']
-        # exclude background
-        if self.loss_cls.use_sigmoid:
-            cls_score = cls_score.sigmoid()
-            scores, indexes = cls_score.view(-1).topk(max_per_img)
-            det_labels = indexes % self.num_classes
-            bbox_index = indexes // self.num_classes
-            bbox_pred = bbox_pred[bbox_index]
-        else:
-            scores, det_labels = F.softmax(cls_score, dim=-1)[..., :-1].max(-1)
-            scores, bbox_index = scores.topk(max_per_img)
-            bbox_pred = bbox_pred[bbox_index]
-            det_labels = det_labels[bbox_index]
+        # raise NotImplementedError('not done yet')
+        # assert len(cls_score) == len(bbox_pred)  # num_queries
+        # max_per_img = self.test_cfg.get('max_per_img', len(cls_score))
 
-        det_bboxes = bbox_cxcywh_to_xyxy(bbox_pred)
-        det_bboxes[:, 0::2] = det_bboxes[:, 0::2] * img_shape[1]
-        det_bboxes[:, 1::2] = det_bboxes[:, 1::2] * img_shape[0]
-        det_bboxes[:, 0::2].clamp_(min=0, max=img_shape[1])
-        det_bboxes[:, 1::2].clamp_(min=0, max=img_shape[0])
+        img_shape = img_meta['img_shape']
+        forg = torch.sigmoid(saliency)
+
+        # get labels
+        out_labels = torch.where(
+            forg > 0.5,
+            self.discretize(mask_feat / norms) + 1,  # shift one for background
+            torch.zeros_like(norms))
+
+        # construct the masks
+        inds = torch.unique(out_labels)
+        num_inst = inds.numel()
+        masks = torch.zeros((num_inst, *out_labels.shape[-2:]),
+                            device=mask_feat.device,
+                            dtype=torch.bool)
+        for i, ind in enumerate(inds):
+            masks[i] = out_labels == ind
+
+        # get classification labels by taking the most common label in the mask
+        cls_labels = torch.zeros((num_inst, ),
+                                 device=mask_feat.device,
+                                 dtype=torch.long)
+        cls_scores = torch.zeros((num_inst, ),
+                                 device=mask_feat.device,
+                                 dtype=torch.float)
+
+        cls_ancors = self.class_anchors / torch.linalg.vector_norm(
+            self.class_anchors, ord=2, dim=1, keepdim=True)
+        scores = torch.nn.functional.conv2d(
+            class_feat /
+            torch.linalg.vector_norm(class_feat, ord=2, dim=0, keepdim=True),
+            weight=cls_ancors.view(cls_ancors.shape[0], cls_ancors.shape[1], 1,
+                                   1))
+        det_bboxes = torch.zeros((num_inst, 4),
+                                 device=mask_feat.device,
+                                 dtype=torch.float)
+
+        for i, ind in enumerate(inds):
+            mask = out_labels == ind
+
+            # get bbox by min/max of mask
+            a = torch.nonzero(mask)
+            bbox = torch.min(a[:, 1]), torch.min(a[:, 0]), torch.max(
+                a[:, 1]), torch.max(a[:, 0])
+
+            # normalize bbox
+            bbox = torch.tensor(
+                bbox, device=mask_feat.device, dtype=torch.float)
+            bbox = bbox / torch.tensor([
+                mask.shape[1],
+                mask.shape[0],
+                mask.shape[1],
+                mask.shape[0],
+            ],
+                                       device=mask_feat.device)
+
+            # scale to img_shape
+            det_bboxes[i, 0::2] *= img_shape[1]
+            det_bboxes[i, 1::2] *= img_shape[0]
+            det_bboxes[i, 0::2].clamp_(min=0, max=img_shape[1])
+            det_bboxes[i, 1::2].clamp_(min=0, max=img_shape[0])
+
+            cls_scores[i], cls_labels[i] = torch.softmax(
+                scores[:, mask[0]].mean(dim=1), dim=0).max(0)
+
         if rescale:
             assert img_meta.get('scale_factor') is not None
             det_bboxes /= det_bboxes.new_tensor(
                 img_meta['scale_factor']).repeat((1, 2))
 
+        # rescale masks to img_shape
+        masks = F.interpolate(
+            masks.unsqueeze(0).float(),
+            size=(img_shape[0], img_shape[1]),
+            mode='bilinear',
+            align_corners=False).squeeze(0)
+
         results = InstanceData()
         results.bboxes = det_bboxes
-        results.scores = scores
-        results.labels = det_labels
+        results.scores = cls_scores
+        results.labels = cls_labels
+        results.masks = masks
         return results

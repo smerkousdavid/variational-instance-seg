@@ -13,6 +13,7 @@ from mmdet.registry import MODELS
 from mmdet.structures import OptSampleList, SampleList
 from mmdet.utils import ConfigType, OptConfigType, OptMultiConfig
 from ..layers import DetrTransformerEncoder, SinePositionalEncoding
+from ..utils.mean_shift import clustering_features, convert_segmentation_to_rgb
 # from ..utils import (filter_scores_and_topk, select_single_mlvl,
 #                      unpack_gt_instances)
 from .base import BaseDetector
@@ -239,6 +240,12 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
         # # create blank
         # inst = torch.zeros_like(forg)
 
+        # clustering
+        # out_label, _ = clustering_features((mask_f / (norms + 1e-5)), num_seeds=100)
+
+        # visualize
+        # clustered_img = convert_segmentation_to_rgb(out_label).to(torch.uint8).detach().clone().cpu().numpy()
+
         # create random projection to 3d
         norms = torch.where(
             forg > 0.5,
@@ -246,6 +253,15 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
             torch.ones_like(norms[0]) *
             10000  # some high number bring vector close to 0
         )
+
+        # get labels
+        out_label = torch.where(
+            forg > 0.5,
+            self.dvis_head.discretize(mask_f[0] / norms) +
+            1,  # shift one for background
+            torch.zeros_like(norms[0]))
+        clustered_img = convert_segmentation_to_rgb(out_label).to(
+            torch.uint8).detach().clone().cpu().numpy()
 
         with torch.no_grad():
             # random projection
@@ -305,8 +321,11 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
                                    1, 2, 0).cpu().numpy()[:, :, :]
             proj = cv2.resize(proj, (input_img.shape[1], input_img.shape[0]))
 
+            clustered_img = cv2.resize(
+                clustered_img, (input_img.shape[1], input_img.shape[0]))
+
             # horz stack
-            input_img = np.hstack((input_img, sal, proj1, proj))
+            input_img = np.hstack((input_img, sal, proj1, proj, clustered_img))
             cv2.imwrite(f'test_{cur_img}.png', input_img)
             cur_img += 1
             cur_img = cur_img % 100
@@ -344,15 +363,9 @@ class DVIS(BaseDetector, metaclass=ABCMeta):
             - bboxes (Tensor): Has a shape (num_instances, 4),
               the last dimension 4 arrange as (x1, y1, x2, y2).
         """
-        return []
-        # raise NotImplementedError('not yet')
         img_feats = self.extract_feat(batch_inputs)
-        head_inputs_dict = self.forward_embedding(img_feats,
-                                                  batch_data_samples)
-        results_list = self.bbox_head.predict(
-            **head_inputs_dict,
-            rescale=rescale,
-            batch_data_samples=batch_data_samples)
+        results_list = self.dvis_head.predict(
+            img_feats, rescale=rescale, batch_data_samples=batch_data_samples)
         batch_data_samples = self.add_pred_to_datasample(
             batch_data_samples, results_list)
         return batch_data_samples
